@@ -21,7 +21,11 @@ export type ExtractedForm = { title: string; url: string; fields: ApplyField[] }
 // introspection — clean ATS (Ashby/Lever/Greenhouse) work well; Workday best-effort.
 export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
   const data = await ctx.evaluate(() => {
-    const clean = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    const normalize = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
+    // The shown label stays short. A trailing star is read on the full text,
+    // before this cut, so a star past 160 characters is not lost and a star
+    // that merely lands on the cut is not treated as the required mark.
+    const clean = (s: string | null | undefined) => normalize(s).slice(0, 160);
     const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim());
     // generic placeholders that masquerade as labels (Ashby/react-select)
     const isGenericPh = (s: string) => /^(start typing|select\b|choose|search\b|type\b|--|please select|e\.?g\.?)/i.test(s.trim());
@@ -36,7 +40,7 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
       if (!node) return "";
       const c = node.cloneNode(true) as Element;
       c.querySelectorAll?.("input, select, textarea, option, button, [role=option], [class*='menu' i]").forEach((n) => n.remove());
-      return clean(c.textContent);
+      return normalize(c.textContent);
     };
 
     // The field WRAPPER (Ashby `ashby-application-form-field-entry`, Greenhouse
@@ -149,7 +153,12 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
         for (const c of Array.from(cands)) {
           if (!isVisibleNode(c)) continue;
           const t = pure(c);
-          if (t && t.length > 2 && t.length < 160 && !optSet.has(t.toLowerCase()) && !isUuid(t) && !isGenericPh(t)) return t;
+          // Keep a long title. clean() shortens what is shown, and the trailing
+          // star is read from this full text. Options are matched on their full
+          // text too. The 160-character cut would hide a real question that only
+          // shares that prefix with an option, and it would let a long option
+          // through as the question.
+          if (t && t.length > 2 && !optSet.has(t.toLowerCase()) && !isUuid(t) && !isGenericPh(t)) return t;
         }
       }
       return "";
@@ -172,14 +181,19 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
       const isCombobox = el.getAttribute("role") === "combobox";
       if (inReactSelect && tag === "input" && !isCombobox) continue;
 
-      const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true";
+      const domRequired = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true";
+      // A trailing star is the board's required mark. A star inside the sentence is not.
+      // The argument is the full label, before clean() cuts it to 160 characters.
+      const requiredFor = (label: string) => domRequired || /\*\s*$/.test(normalize(label));
       const nativeId = (el as HTMLElement).id || undefined;
       const nativeName = (el as HTMLInputElement).name || undefined;
       const fid = `co${n++}`;
 
       if (isCombobox) {
         el.setAttribute("data-co-field", fid);
-        fields.push({ id: fid, type: "select", combobox: true, label: clean(labelFor(el)), required, options: [], nativeId, nativeName });
+        const labelRaw = labelFor(el);
+        const label = clean(labelRaw);
+        fields.push({ id: fid, type: "select", combobox: true, label, required: requiredFor(labelRaw), options: [], nativeId, nativeName });
         continue;
       }
 
@@ -191,12 +205,15 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
         }
         if (name) seenRadio.add(name);
         const group = Array.from(document.querySelectorAll(`input[type=radio][name="${CSS.escape(name)}"]`));
-        const options = group.map((r) => clean(labelFor(r) || (r as HTMLInputElement).value)).filter(Boolean);
+        const optionFull = group.map((r) => normalize(labelFor(r) || (r as HTMLInputElement).value)).filter(Boolean);
+        const options = optionFull.map((t) => clean(t));
         group.forEach((r, i) => {
           r.setAttribute("data-co-field", fid);
           r.setAttribute("data-co-option", options[i] ?? String(i));
         });
-        fields.push({ id: fid, type: "radio", label: clean(groupLabel(el, options)) || name, required, options });
+        const radioRaw = groupLabel(el, optionFull);
+        const radioLabel = clean(radioRaw) || name;
+        fields.push({ id: fid, type: "radio", label: radioLabel, required: requiredFor(clean(radioRaw) ? radioRaw : (name || "")), options });
         continue;
       }
 
@@ -204,16 +221,20 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
 
       if (tag === "select") {
         const options = Array.from((el as HTMLSelectElement).options).map((o) => clean(o.textContent)).filter((o) => o && !/^(select|choose|--)/i.test(o));
-        fields.push({ id: fid, type: "select", label: clean(labelFor(el)), required, options, nativeId, nativeName });
+        const selectRaw = labelFor(el);
+        const selectLabel = clean(selectRaw);
+        fields.push({ id: fid, type: "select", label: selectLabel, required: requiredFor(selectRaw), options, nativeId, nativeName });
         continue;
       }
       const type = tag === "textarea" ? "textarea" : ["email", "tel", "url", "number", "date", "checkbox", "file", "password"].includes(itype) ? itype : "text";
       const ml = (el as HTMLInputElement).maxLength;
+      const labelRaw = labelFor(el);
+      const label = clean(labelRaw);
       fields.push({
         id: fid,
         type,
-        label: clean(labelFor(el)),
-        required,
+        label,
+        required: requiredFor(labelRaw),
         maxLength: ml && ml > 0 ? ml : undefined,
         value: (el as HTMLInputElement).value || undefined,
         nativeId,
